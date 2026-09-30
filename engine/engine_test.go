@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"buildengine/engine"
@@ -345,5 +346,341 @@ func TestCycleRejected(t *testing.T) {
 	}
 	if err := e.Build("a"); err == nil {
 		t.Fatal("expected cycle error")
+	}
+}
+
+func TestSameNameOutputsInDifferentDirectories(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "a_src.txt", "AAA")
+	write(t, root, "b_src.txt", "BBB")
+	e, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.RegisterTool("copy", engine.ToolFunc(tools.Copy))
+	actions := []engine.Action{
+		{ID: "a", Tool: "copy", Inputs: []string{"a_src.txt"}, Outputs: []string{"dir1/out.txt"}},
+		{ID: "b", Tool: "copy", Inputs: []string{"b_src.txt"}, Outputs: []string{"dir2/out.txt"}},
+	}
+	for _, a := range actions {
+		if err := e.AddAction(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.Build("a", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, root, "dir1/out.txt"); got != "AAA" {
+		t.Fatalf("dir1/out.txt = %q, want AAA", got)
+	}
+	if got := read(t, root, "dir2/out.txt"); got != "BBB" {
+		t.Fatalf("dir2/out.txt = %q, want BBB", got)
+	}
+
+	// One action changes; the same-named output in the other directory must
+	// not be mistaken for its staged sibling or overwritten.
+	write(t, root, "a_src.txt", "AAA2")
+	if err := e.Build("a", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, root, "dir1/out.txt"); got != "AAA2" {
+		t.Fatalf("dir1/out.txt = %q, want AAA2", got)
+	}
+	if got := read(t, root, "dir2/out.txt"); got != "BBB" {
+		t.Fatalf("dir2/out.txt changed to %q, want BBB", got)
+	}
+	wantRan := []string{"a"}
+	if !reflect.DeepEqual(e.Ran, wantRan) {
+		t.Fatalf("ran %v, want %v", e.Ran, wantRan)
+	}
+
+	// Restart: both same-named outputs remain valid cache hits.
+	e2, _ := engine.New(root)
+	e2.RegisterTool("copy", engine.ToolFunc(tools.Copy))
+	for _, a := range actions {
+		if err := e2.AddAction(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e2.Build("a", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if len(e2.Ran) != 0 {
+		t.Fatalf("after restart reran %v", e2.Ran)
+	}
+}
+
+// writeBoth writes identical bytes to all declared outputs. It models a
+// multi-output action where a rebuild may leave some outputs byte-identical.
+func writeBoth(content string) engine.Tool {
+	return engine.ToolFunc(func(params map[string]string, inputs, outputs []string) error {
+		for _, o := range outputs {
+			if err := os.MkdirAll(filepath.Dir(o), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(o, []byte(content), 0o644); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func TestPublishFailureRollsBackWholeAction(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "v1")
+	action := engine.Action{ID: "gen", Tool: "multi", Inputs: []string{"src.txt"}, Outputs: []string{"out/a.txt", "out/sub/b.txt"}}
+
+	newEngine := func() *engine.Engine {
+		e, err := engine.New(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.RegisterTool("multi", writeBoth("v1"))
+		e.RegisterTool("copy", engine.ToolFunc(tools.Copy))
+		return e
+	}
+
+	e := newEngine()
+	if err := e.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddAction(engine.Action{ID: "down", Tool: "copy", Inputs: []string{"out/a.txt"}, Outputs: []string{"down/d.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("gen", "down"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, root, "down/d.txt"); got != "v1" {
+		t.Fatalf("down/d.txt = %q, want v1", got)
+	}
+
+	// Interrupted rebuild: a.txt gets new content while sub/b.txt is
+	// unchanged. The tool blocks publication of the second output by
+	// replacing its parent directory with a regular file, so the first
+	// rename has already happened when publish fails.
+	write(t, root, "src.txt", "v2")
+	e2 := newEngine()
+	e2.RegisterTool("multi", engine.ToolFunc(func(params map[string]string, inputs, outputs []string) error {
+		if err := os.WriteFile(outputs[0], []byte("v2"), 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(outputs[1], []byte("v1"), 0o644); err != nil {
+			return err
+		}
+		block := filepath.Join(root, "out", "sub")
+		if err := os.RemoveAll(block); err != nil {
+			return err
+		}
+		return os.WriteFile(block, []byte("occupied"), 0o644)
+	}))
+	if err := e2.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e2.AddAction(engine.Action{ID: "down", Tool: "copy", Inputs: []string{"out/a.txt"}, Outputs: []string{"down/d.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e2.Build("gen", "down"); err == nil {
+		t.Fatal("expected interrupted publish to fail")
+	}
+
+	// Atomic rollback: the replaced first output is restored to v1 and
+	// the dependent never ran against a half-published result. (The
+	// obstruction itself removed out/sub, simulating the I/O fault.)
+	for _, f := range []string{"out/a.txt", "down/d.txt"} {
+		if got := read(t, root, f); got != "v1" {
+			t.Fatalf("%s = %q, want v1 after rollback", f, got)
+		}
+	}
+	// No staging residue is left behind.
+	entries, _ := os.ReadDir(root)
+	for _, ent := range entries {
+		if ent.IsDir() && strings.HasPrefix(ent.Name(), ".staging-") {
+			t.Fatalf("staging directory left behind: %s", ent.Name())
+		}
+	}
+}
+
+func TestUnchangedOutputKeptAcrossRebuild(t *testing.T) {
+	// A multi-output action where only one output changes on rebuild. The
+	// unchanged sibling is republished atomically and the resulting set is
+	// accepted by the incremental cache, including after restart.
+	root := t.TempDir()
+	write(t, root, "src.txt", "v1")
+	action := engine.Action{ID: "gen", Tool: "multi", Inputs: []string{"src.txt"}, Outputs: []string{"out/a.txt", "out/b.txt"}}
+	run := func(contentA, contentB string) *engine.Engine {
+		e, _ := engine.New(root)
+		e.RegisterTool("multi", engine.ToolFunc(func(params map[string]string, inputs, outputs []string) error {
+			contents := []string{contentA, contentB}
+			for i, o := range outputs {
+				if err := os.WriteFile(o, []byte(contents[i]), 0o644); err != nil {
+					return err
+				}
+			}
+			return nil
+		}))
+		if err := e.AddAction(action); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	if err := run("v1", "common").Build("gen"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "src.txt", "v2")
+	if err := run("v2", "common").Build("gen"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, root, "out/a.txt"); got != "v2" {
+		t.Fatalf("out/a.txt = %q, want v2", got)
+	}
+	if got := read(t, root, "out/b.txt"); got != "common" {
+		t.Fatalf("out/b.txt = %q, want common", got)
+	}
+	e := run("v2", "common")
+	if err := e.Build("gen"); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.Ran) != 0 {
+		t.Fatalf("unchanged-output set reran after restart: %v", e.Ran)
+	}
+}
+
+func TestFailedPublishRebuildsAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "v1")
+	action := engine.Action{ID: "gen", Tool: "multi", Inputs: []string{"src.txt"}, Outputs: []string{"out/a.txt", "out/sub/b.txt"}}
+
+	e, _ := engine.New(root)
+	e.RegisterTool("multi", writeBoth("v1"))
+	if err := e.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("gen"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail a rebuild midway, as in TestPublishFailureRollsBackWholeAction.
+	write(t, root, "src.txt", "v2")
+	e2, _ := engine.New(root)
+	e2.RegisterTool("multi", engine.ToolFunc(func(params map[string]string, inputs, outputs []string) error {
+		if err := writeBoth("v2").Run(params, inputs, outputs); err != nil {
+			return err
+		}
+		block := filepath.Join(root, "out", "sub")
+		if err := os.RemoveAll(block); err != nil {
+			return err
+		}
+		return os.WriteFile(block, []byte("occupied"), 0o644)
+	}))
+	if err := e2.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e2.Build("gen"); err == nil {
+		t.Fatal("expected interrupted publish to fail")
+	}
+
+	// After restart with the obstruction cleared, no failed fragment is
+	// considered a cache hit: gen reruns and publishes v2 consistently.
+	if err := os.Remove(filepath.Join(root, "out", "sub")); err != nil {
+		t.Fatal(err)
+	}
+	e3, _ := engine.New(root)
+	e3.RegisterTool("multi", writeBoth("v2"))
+	if err := e3.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e3.Build("gen"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(e3.Ran, []string{"gen"}) {
+		t.Fatalf("ran %v, want [gen]", e3.Ran)
+	}
+	if got := read(t, root, "out/a.txt"); got != "v2" {
+		t.Fatalf("out/a.txt = %q, want v2", got)
+	}
+	if got := read(t, root, "out/sub/b.txt"); got != "v2" {
+		t.Fatalf("out/sub/b.txt = %q, want v2", got)
+	}
+
+	// One more restart is a clean no-op.
+	e4, _ := engine.New(root)
+	e4.RegisterTool("multi", writeBoth("v2"))
+	if err := e4.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e4.Build("gen"); err != nil {
+		t.Fatal(err)
+	}
+	if len(e4.Ran) != 0 {
+		t.Fatalf("post-recovery restart reran %v", e4.Ran)
+	}
+}
+
+func TestDependentNeverReadsHalfPublishedOutputs(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "v1")
+	e, _ := engine.New(root)
+	e.RegisterTool("copy", engine.ToolFunc(tools.Copy))
+	if err := e.AddAction(engine.Action{ID: "gen", Tool: "copy", Inputs: []string{"src.txt"}, Outputs: []string{"out/g.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var seen string
+	e.RegisterTool("reader", engine.ToolFunc(func(params map[string]string, inputs, outputs []string) error {
+		data, err := os.ReadFile(inputs[0])
+		if err != nil {
+			return err
+		}
+		seen = string(data)
+		return os.WriteFile(outputs[0], data, 0o644)
+	}))
+	if err := e.AddAction(engine.Action{ID: "use", Tool: "reader", Inputs: []string{"out/g.txt"}, Outputs: []string{"down/u.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("use"); err != nil {
+		t.Fatal(err)
+	}
+	if seen != "v1" {
+		t.Fatalf("dependent read %q, want v1", seen)
+	}
+
+	// Change the source; gen reruns before use, and use must observe the
+	// fully published new output rather than anything staged or missing.
+	write(t, root, "src.txt", "v2")
+	if err := e.Build("use"); err != nil {
+		t.Fatal(err)
+	}
+	if seen != "v2" {
+		t.Fatalf("dependent read %q, want v2", seen)
+	}
+}
+
+func TestStaleStagingRemovedOnOpen(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "x")
+	stale := filepath.Join(root, ".staging-crashed-123")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, "ghost.txt"), []byte("ghost"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale staging dir survived New: %v", err)
+	}
+	e.RegisterTool("copy", engine.ToolFunc(tools.Copy))
+	if err := e.AddAction(engine.Action{ID: "a", Tool: "copy", Inputs: []string{"src.txt"}, Outputs: []string{"o.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("a"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, root, "o.txt"); got != "x" {
+		t.Fatalf("o.txt = %q, want x", got)
 	}
 }
