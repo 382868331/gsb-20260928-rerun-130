@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -345,5 +346,279 @@ func TestCycleRejected(t *testing.T) {
 	}
 	if err := e.Build("a"); err == nil {
 		t.Fatal("expected cycle error")
+	}
+}
+
+// writeBoth copies input 0 to every declared output, keeping multi-output
+// actions deterministic in tests.
+func writeBoth(params map[string]string, inputs, outputs []string) error {
+	if len(inputs) != 1 {
+		return fmt.Errorf("writeBoth: want 1 input, got %d", len(inputs))
+	}
+	data, err := os.ReadFile(inputs[0])
+	if err != nil {
+		return err
+	}
+	for _, o := range outputs {
+		if err := os.MkdirAll(filepath.Dir(o), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(o, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestSameBasenameOutputsInDifferentDirs(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "payload")
+	e, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.RegisterTool("writeBoth", engine.ToolFunc(writeBoth))
+	// Two outputs sharing basename "out.txt" in different directories.
+	action := engine.Action{
+		ID:      "fan",
+		Tool:    "writeBoth",
+		Inputs:  []string{"src.txt"},
+		Outputs: []string{"d1/sub/out.txt", "d2/sub/out.txt"},
+	}
+	if err := e.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("fan"); err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	for _, f := range []string{"d1/sub/out.txt", "d2/sub/out.txt"} {
+		if got := read(t, root, f); got != "payload" {
+			t.Fatalf("%s = %q, want payload", f, got)
+		}
+	}
+
+	// No-op rebuild after restart: distinct identity preserved on disk.
+	e2, _ := engine.New(root)
+	e2.RegisterTool("writeBoth", engine.ToolFunc(writeBoth))
+	if err := e2.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e2.Build("fan"); err != nil {
+		t.Fatal(err)
+	}
+	if len(e2.Ran) != 0 {
+		t.Fatalf("restart reran %v", e2.Ran)
+	}
+}
+
+func TestPublishInterruptKeepsOldVersion(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "v1")
+	e, _ := engine.New(root)
+	e.RegisterTool("writeBoth", engine.ToolFunc(writeBoth))
+	action := engine.Action{
+		ID:      "fan",
+		Tool:    "writeBoth",
+		Inputs:  []string{"src.txt"},
+		Outputs: []string{"dir/d1/out.txt", "dir/d2/out.txt"},
+	}
+	if err := e.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("fan"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block the second output's destination with a non-empty directory:
+	// MkdirAll preparation passes (the path already exists as a directory),
+	// but the rename onto the occupied path fails *after* the first output
+	// has already been published. The whole publish must roll back.
+	write(t, root, "src.txt", "v2")
+	blocker := filepath.Join(root, "dir", "d2", "out.txt")
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(blocker, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blocker, "occupied"), []byte("blocker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("fan"); err == nil {
+		t.Fatal("expected publish failure")
+	}
+
+	// Old products remain the consistent previous version; no fragments.
+	if got := read(t, root, "dir/d1/out.txt"); got != "v1" {
+		t.Fatalf("first output changed to %q, old version expected", got)
+	}
+	if data, err := os.ReadFile(filepath.Join(blocker, "occupied")); err != nil || string(data) != "blocker" {
+		t.Fatalf("blocker disturbed: %q %v", data, err)
+	}
+	// State still validates the old version after restart.
+	e2, _ := engine.New(root)
+	e2.RegisterTool("writeBoth", engine.ToolFunc(writeBoth))
+	if err := e2.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Dir(blocker)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e2.Build("fan"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, root, "dir/d1/out.txt"); got != "v2" {
+		t.Fatalf("d1 = %q, want v2", got)
+	}
+	if got := read(t, root, "dir/d2/out.txt"); got != "v2" {
+		t.Fatalf("d2 = %q, want v2", got)
+	}
+}
+
+func TestMultiOutputPartialUnchangedIncremental(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "in1.txt", "one")
+	write(t, root, "in2.txt", "two")
+	e, _ := engine.New(root)
+	// genPack emits two outputs from two inputs.
+	genPack := func(params map[string]string, inputs, outputs []string) error {
+		if len(inputs) != 2 || len(outputs) != 2 {
+			return fmt.Errorf("genPack: bad arity")
+		}
+		a, err := os.ReadFile(inputs[0])
+		if err != nil {
+			return err
+		}
+		b, err := os.ReadFile(inputs[1])
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(outputs[0], a, 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(outputs[1], b, 0o644)
+	}
+	e.RegisterTool("genPack", engine.ToolFunc(genPack))
+	e.RegisterTool("copy", engine.ToolFunc(tools.Copy))
+	pack := engine.Action{
+		ID:      "pack",
+		Tool:    "genPack",
+		Inputs:  []string{"in1.txt", "in2.txt"},
+		Outputs: []string{"gen/a.txt", "gen/b.txt"},
+	}
+	consume := engine.Action{
+		ID:      "consume",
+		Tool:    "copy",
+		Inputs:  []string{"gen/b.txt"},
+		Outputs: []string{"out/b-copy.txt"},
+	}
+	if err := e.AddAction(pack); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddAction(consume); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("consume"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Change only in1: pack reruns (b.txt content is unchanged), but the
+	// action depending on b.txt must not rerun.
+	write(t, root, "in1.txt", "one-v2")
+	if err := e.Build("consume"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(e.Ran, []string{"pack"}) {
+		t.Fatalf("ran %v, want only [pack]", e.Ran)
+	}
+	if got := read(t, root, "gen/a.txt"); got != "one-v2" {
+		t.Fatalf("a.txt = %q", got)
+	}
+	if got := read(t, root, "gen/b.txt"); got != "two" {
+		t.Fatalf("b.txt = %q", got)
+	}
+	if got := read(t, root, "out/b-copy.txt"); got != "two" {
+		t.Fatalf("b-copy.txt = %q", got)
+	}
+
+	// After restart the same cache state holds: no fragments confused for
+	// success, consume still up to date.
+	e2, _ := engine.New(root)
+	e2.RegisterTool("genPack", engine.ToolFunc(genPack))
+	e2.RegisterTool("copy", engine.ToolFunc(tools.Copy))
+	if err := e2.AddAction(pack); err != nil {
+		t.Fatal(err)
+	}
+	if err := e2.AddAction(consume); err != nil {
+		t.Fatal(err)
+	}
+	if err := e2.Build("consume"); err != nil {
+		t.Fatal(err)
+	}
+	if len(e2.Ran) != 0 {
+		t.Fatalf("restart reran %v", e2.Ran)
+	}
+}
+
+func TestCrashedStagingFragmentsNotReused(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "hello")
+	action := engine.Action{
+		ID:      "fan",
+		Tool:    "writeBoth",
+		Inputs:  []string{"src.txt"},
+		Outputs: []string{"d1/out.txt", "d2/out.txt"},
+	}
+
+	// Simulate a crash mid-build: a leftover staging directory containing
+	// fragment content, with no recorded state.
+	leftover := filepath.Join(root, ".staging-fan-crash")
+	if err := os.MkdirAll(filepath.Join(leftover, "d1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leftover, "d1", "out.txt"), []byte("FRAGMENT"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e, _ := engine.New(root)
+	e.RegisterTool("writeBoth", engine.ToolFunc(writeBoth))
+	if err := e.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("fan"); err != nil {
+		t.Fatalf("build should ignore fragments: %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, en := range entries {
+		if len(en.Name()) >= 9 && en.Name()[:9] == ".staging-" {
+			t.Fatalf("staging fragment left on disk: %s", en.Name())
+		}
+	}
+	if got := read(t, root, "d1/out.txt"); got != "hello" {
+		t.Fatalf("fragment treated as result: %q", got)
+	}
+}
+
+func TestDependencyCannotReadHalfPublishedResult(t *testing.T) {
+	root := t.TempDir()
+	e, _ := engine.New(root)
+	e.RegisterTool("copy", engine.ToolFunc(tools.Copy))
+	// down depends on a product that was never published.
+	if err := e.AddAction(engine.Action{
+		ID:      "down",
+		Tool:    "copy",
+		Inputs:  []string{"gen/missing.txt"},
+		Outputs: []string{"out/o.txt"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Build("down"); err == nil {
+		t.Fatal("expected failure on missing dependency input")
+	}
+	if _, err := os.Stat(filepath.Join(root, "out", "o.txt")); !os.IsNotExist(err) {
+		t.Fatalf("output produced from phantom input: %v", err)
 	}
 }

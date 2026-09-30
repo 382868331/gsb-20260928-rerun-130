@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Action describes one controlled generation step.
@@ -78,6 +79,16 @@ func New(root string) (*Engine, error) {
 	}
 	e.statePath = filepath.Join(root, ".buildstate.json")
 	e.state.Actions = map[string]*actionState{}
+	// Sweep staging directories left behind by a crashed or killed build.
+	// Such fragments are never recorded state and must never be mistaken
+	// for published products.
+	if entries, err := os.ReadDir(root); err == nil {
+		for _, en := range entries {
+			if en.IsDir() && strings.HasPrefix(en.Name(), ".staging-") {
+				_ = os.RemoveAll(filepath.Join(root, en.Name()))
+			}
+		}
+	}
 	data, err := os.ReadFile(e.statePath)
 	if err == nil {
 		if err := json.Unmarshal(data, &e.state); err != nil {
@@ -87,6 +98,19 @@ func New(root string) (*Engine, error) {
 		return nil, err
 	}
 	return e, nil
+}
+
+// cleanRel validates p as a workspace-relative path that cannot escape
+// the engine root. It returns the cleaned form.
+func cleanRel(p string) (string, error) {
+	if p == "" || filepath.IsAbs(p) {
+		return "", fmt.Errorf("path %q must be relative", p)
+	}
+	c := filepath.Clean(p)
+	if c == "." || c == ".." || strings.HasPrefix(c, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path %q escapes the workspace", p)
+	}
+	return c, nil
 }
 
 // RegisterTool adds a controlled tool to the registry.
@@ -107,14 +131,40 @@ func (e *Engine) AddAction(a Action) error {
 	if len(a.Outputs) == 0 {
 		return fmt.Errorf("action %q declares no outputs", a.ID)
 	}
-	for _, out := range a.Outputs {
+	seen := map[string]bool{}
+	for _, raw := range a.Inputs {
+		in, err := cleanRel(raw)
+		if err != nil {
+			return err
+		}
+		if seen[in] {
+			return fmt.Errorf("action %q lists input %q more than once", a.ID, in)
+		}
+		seen[in] = true
+	}
+	seen = map[string]bool{}
+	for _, raw := range a.Outputs {
+		out, err := cleanRel(raw)
+		if err != nil {
+			return err
+		}
+		if seen[out] {
+			return fmt.Errorf("action %q lists output %q more than once", a.ID, out)
+		}
+		seen[out] = true
 		if prev, ok := e.producer[out]; ok {
 			return fmt.Errorf("output %q produced by both %q and %q", out, prev, a.ID)
 		}
 	}
 	cp := a
+	for i := range cp.Inputs {
+		cp.Inputs[i], _ = cleanRel(cp.Inputs[i])
+	}
+	for i := range cp.Outputs {
+		cp.Outputs[i], _ = cleanRel(cp.Outputs[i])
+	}
 	e.actions[a.ID] = &cp
-	for _, out := range a.Outputs {
+	for _, out := range cp.Outputs {
 		e.producer[out] = a.ID
 	}
 	return nil
@@ -306,6 +356,22 @@ func (e *Engine) Build(targets ...string) error {
 // run executes one action with staged outputs and atomic publish.
 func (e *Engine) run(a *Action) error {
 	tool := e.tools[a.Tool]
+	// Preflight inputs: an action may only consume published files that
+	// actually exist, never a half-published result. Fingerprinting below
+	// reads the same files for the cache key.
+	for _, in := range a.Inputs {
+		info, err := os.Stat(filepath.Join(e.root, in))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("action %q: missing input %q", a.ID, in)
+			}
+			return fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("action %q: input %q is a directory", a.ID, in)
+		}
+	}
+
 	staging, err := os.MkdirTemp(e.root, ".staging-"+a.ID+"-")
 	if err != nil {
 		return err
@@ -318,14 +384,20 @@ func (e *Engine) run(a *Action) error {
 	}
 	staged := make([]string, len(a.Outputs))
 	for i, out := range a.Outputs {
-		staged[i] = filepath.Join(staging, filepath.Base(out))
+		// Mirror the output's workspace-relative path inside staging so
+		// outputs with the same basename in different directories stay
+		// distinct instead of collapsing onto one staged file.
+		d := filepath.Join(staging, filepath.Dir(out))
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return err
+		}
+		staged[i] = filepath.Join(staging, out)
 	}
 	if err := tool.Run(a.Params, inputs, staged); err != nil {
 		return fmt.Errorf("action %q failed: %w", a.ID, err)
 	}
 
-	// Verify then publish: staged outputs are renamed into place only after
-	// all of them exist, so a failure never publishes half a product.
+	// Verify all staged products before touching the workspace.
 	hashes := map[string]string{}
 	for i, out := range a.Outputs {
 		h, err := hashFile(staged[i])
@@ -334,22 +406,106 @@ func (e *Engine) run(a *Action) error {
 		}
 		hashes[out] = h
 	}
-	for i, out := range a.Outputs {
-		dest := filepath.Join(e.root, out)
-		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			return err
-		}
-		if err := os.Rename(staged[i], dest); err != nil {
-			return fmt.Errorf("publish %q: %w", out, err)
-		}
-	}
 
 	fp, err := e.fingerprint(a)
 	if err != nil {
 		return err
 	}
-	e.state.Actions[a.ID] = &actionState{Fingerprint: fp, Outputs: hashes}
-	return e.saveState()
+
+	// Prepare destination directories before publishing anything.
+	madeDirs := map[string]bool{}
+	for _, out := range a.Outputs {
+		dir := filepath.Dir(filepath.Join(e.root, out))
+		rel, relErr := filepath.Rel(e.root, dir)
+		if relErr != nil || rel == "." {
+			continue
+		}
+		parts := strings.Split(rel, string(os.PathSeparator))
+		for n := 1; n <= len(parts); n++ {
+			sub := filepath.Join(parts[:n]...)
+			abs := filepath.Join(e.root, sub)
+			if info, statErr := os.Stat(abs); statErr == nil && info.IsDir() {
+				continue
+			}
+			if mkErr := os.Mkdir(abs, 0o755); mkErr != nil {
+				return fmt.Errorf("publish %q: %w", out, mkErr)
+			}
+			madeDirs[sub] = true
+		}
+	}
+
+	// Whole-product publish: move every output into place, tracking each
+	// rename so a failure midway rolls back to the previous consistent
+	// version. Old files are moved aside (not deleted) until all renames
+	// have succeeded.
+	type moved struct {
+		out    string
+		dest   string
+		staged string
+		backup string
+		hadOld bool
+	}
+	var moves []moved
+	published := 0
+	oldState := e.state.Actions[a.ID]
+	rollback := func() {
+		for j := published - 1; j >= 0; j-- {
+			m := moves[j]
+			_ = os.RemoveAll(m.dest)
+			if m.hadOld {
+				_ = os.Rename(m.backup, m.dest)
+			}
+			_ = os.Rename(m.staged, filepath.Join(staging, m.out))
+		}
+		// Remove directories this publish created, innermost first.
+		dirs := make([]string, 0, len(madeDirs))
+		for d := range madeDirs {
+			dirs = append(dirs, d)
+		}
+		sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+		for _, d := range dirs {
+			_ = os.Remove(filepath.Join(e.root, d))
+		}
+	}
+
+	for i, out := range a.Outputs {
+		dest := filepath.Join(e.root, out)
+		m := moved{out: out, dest: dest, staged: staged[i]}
+		if info, statErr := os.Stat(dest); statErr == nil && !info.IsDir() {
+			m.hadOld = true
+			m.backup = filepath.Join(staging, ".old", fmt.Sprint(i))
+			if err := os.MkdirAll(filepath.Dir(m.backup), 0o755); err != nil {
+				return fmt.Errorf("publish %q: %w", out, err)
+			}
+			if err := os.Rename(dest, m.backup); err != nil {
+				rollback()
+				return fmt.Errorf("publish %q: %w", out, err)
+			}
+		}
+		if err := os.Rename(staged[i], dest); err != nil {
+			if m.hadOld {
+				_ = os.Rename(m.backup, dest)
+			}
+			rollback()
+			return fmt.Errorf("publish %q: %w", out, err)
+		}
+		moves = append(moves, m)
+		published++
+	}
+
+	// All products are published: commit state, then discard old versions.
+	newState := &actionState{Fingerprint: fp, Outputs: hashes}
+	e.state.Actions[a.ID] = newState
+	if err := e.saveState(); err != nil {
+		rollback()
+		if oldState != nil {
+			e.state.Actions[a.ID] = oldState
+		} else {
+			delete(e.state.Actions, a.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (e *Engine) saveState() error {
