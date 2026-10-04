@@ -27,15 +27,26 @@ const (
 
 // ActionReport is the provenance record for one action: what the build
 // actually used and produced, by content hash, or why it did not run.
+//
+// Started distinguishes "never began" (cancelled before scheduling, or
+// skipped because a prerequisite did not complete) from "began but did
+// not succeed" (failed, or its inputs drifted mid-build). For every
+// started action the report keeps the fingerprint and input content
+// hashes captured at the moment execution began, so a failed or drifted
+// attempt still explains which input versions it read. DependsOn and
+// InputFrom record where each input came from.
 type ActionReport struct {
 	ID          string            `json:"id"`
 	Status      string            `json:"status"`
 	Reason      string            `json:"reason,omitempty"`
+	Started     bool              `json:"started,omitempty"`
 	Tool        string            `json:"tool,omitempty"`
 	Params      map[string]string `json:"params,omitempty"`
 	Fingerprint string            `json:"fingerprint,omitempty"`
-	Inputs      map[string]string `json:"inputs,omitempty"`  // path -> content hash
-	Outputs     map[string]string `json:"outputs,omitempty"` // path -> content hash
+	DependsOn   []string          `json:"depends_on,omitempty"` // producing action IDs
+	InputFrom   map[string]string `json:"input_from,omitempty"` // input path -> producing action ID
+	Inputs      map[string]string `json:"inputs,omitempty"`     // path -> content hash
+	Outputs     map[string]string `json:"outputs,omitempty"`    // path -> content hash
 }
 
 // BuildReport is the outcome of one BuildReport call, in execution order.
@@ -105,6 +116,15 @@ func (e *Engine) BuildReport(ctx context.Context, targets ...string) *BuildRepor
 	for _, id := range order {
 		a := e.actions[id]
 		ar := &ActionReport{ID: id, Tool: a.Tool, Params: a.Params}
+		ar.DependsOn = e.deps(a)
+		for _, in := range a.Inputs {
+			if pid, ok := e.producer[in]; ok && pid != a.ID {
+				if ar.InputFrom == nil {
+					ar.InputFrom = map[string]string{}
+				}
+				ar.InputFrom[in] = pid
+			}
+		}
 		rep.Actions = append(rep.Actions, ar)
 
 		if ctx.Err() != nil {
@@ -155,6 +175,14 @@ func (e *Engine) BuildReport(ctx context.Context, targets ...string) *BuildRepor
 		if err != nil {
 			ar.Status = StatusFailed
 			ar.Reason = err.Error()
+			if inputs != nil {
+				// The attempt began: record exactly which input
+				// versions it read, captured at start, never
+				// re-hashed from the workspace afterwards.
+				ar.Started = true
+				ar.Fingerprint = fingerprintFrom(a, inputs)
+				ar.Inputs = inputs
+			}
 			status[id] = ar.Status
 			if rep.Err == nil {
 				rep.Err = err
@@ -163,6 +191,7 @@ func (e *Engine) BuildReport(ctx context.Context, targets ...string) *BuildRepor
 		}
 		st := e.state.Actions[id]
 		ar.Status = StatusRan
+		ar.Started = true
 		ar.Fingerprint = st.Fingerprint
 		ar.Inputs = inputs
 		ar.Outputs = st.Outputs

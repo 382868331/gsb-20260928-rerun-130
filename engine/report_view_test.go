@@ -299,3 +299,156 @@ func TestSharedDependencyShownOnce(t *testing.T) {
 		t.Fatalf("shared prerequisite ran %d times", ran)
 	}
 }
+
+func TestFailedActionKeepsStartFingerprintAndProvenance(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "hello")
+	write(t, root, "bad.txt", "boom")
+	e := diamond(t, root)
+	e.RegisterTool("fail", engine.ToolFunc(func(map[string]string, []string, []string) error {
+		return errors.New("always fails")
+	}))
+	// bad consumes gen's product and fails; downstream depends on bad.
+	if err := e.AddAction(engine.Action{ID: "bad", Tool: "fail",
+		Inputs: []string{"gen/a.txt", "bad.txt"}, Outputs: []string{"out/bad.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddAction(engine.Action{ID: "after", Tool: "copy",
+		Inputs: []string{"out/bad.txt"}, Outputs: []string{"out/after.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	rep := e.BuildReport(context.Background(), "after")
+	if rep.Err == nil {
+		t.Fatal("expected failure")
+	}
+	bad := rep.Get("bad")
+	if bad.Status != engine.StatusFailed || !bad.Started {
+		t.Fatalf("bad should be failed+started, got %q started=%v", bad.Status, bad.Started)
+	}
+	if bad.Tool != "fail" || bad.Fingerprint == "" {
+		t.Fatalf("failed action lost tool identity or fingerprint: %+v", bad)
+	}
+	// The inputs the failed attempt actually read, incl. gen's product.
+	if bad.Inputs["bad.txt"] == "" || bad.Inputs["gen/a.txt"] == "" {
+		t.Fatalf("failed action lost its start-time inputs: %+v", bad.Inputs)
+	}
+	if len(bad.DependsOn) != 1 || bad.DependsOn[0] != "gen" || bad.InputFrom["gen/a.txt"] != "gen" {
+		t.Fatalf("failed action lost dependency provenance: %+v", bad)
+	}
+	// after never began: skipped, not started, but provenance recorded.
+	after := rep.Get("after")
+	if after.Status != engine.StatusSkipped || after.Started {
+		t.Fatalf("after should be skipped+not started, got %q started=%v", after.Status, after.Started)
+	}
+	if after.Fingerprint != "" || len(after.Inputs) != 0 {
+		t.Fatalf("unstarted action must not invent a fingerprint: %+v", after)
+	}
+	if len(after.DependsOn) != 1 || after.DependsOn[0] != "bad" {
+		t.Fatalf("skipped action lost dependency provenance: %+v", after)
+	}
+
+	// The saved view keeps the failed attempt's evidence across reopen,
+	// even after the inputs change on disk afterwards.
+	if _, err := e.SaveView("failed", rep); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "bad.txt", "edited afterwards")
+	e2, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := e2.View("failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := v.Actions[0]
+	for _, a := range v.Actions {
+		if a.ID == "bad" {
+			got = a
+		}
+	}
+	if got.Inputs["bad.txt"] != bad.Inputs["bad.txt"] || got.Fingerprint != bad.Fingerprint {
+		t.Fatalf("reopened view was rewritten from current files: %+v", got)
+	}
+}
+
+func TestDriftedActionKeepsPreRunInputs(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "hello")
+	e, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.RegisterTool("mutate", engine.ToolFunc(func(params map[string]string, inputs, outputs []string) error {
+		if err := os.WriteFile(inputs[0], []byte("sneaky"), 0o644); err != nil {
+			return err
+		}
+		return tools.Copy(params, inputs, outputs)
+	}))
+	if err := e.AddAction(engine.Action{ID: "gen", Tool: "mutate",
+		Inputs: []string{"src.txt"}, Outputs: []string{"out/a.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	rep := e.BuildReport(context.Background(), "gen")
+	gen := rep.Get("gen")
+	if gen.Status != engine.StatusFailed || !gen.Started {
+		t.Fatalf("drifted action should be failed+started, got %q", gen.Status)
+	}
+	if !strings.Contains(gen.Reason, "changed during build") {
+		t.Fatalf("expected drift reason, got %q", gen.Reason)
+	}
+	// The recorded input is the version read at start ("hello"), not the
+	// mutated content now on disk.
+	if gen.Inputs["src.txt"] == "" || gen.Fingerprint == "" {
+		t.Fatalf("drifted action lost start-time fingerprint: %+v", gen)
+	}
+	if _, err := e.SaveView("drift", rep); err != nil {
+		t.Fatal(err)
+	}
+	e2, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := e2.View("drift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Actions[0].Inputs["src.txt"] != gen.Inputs["src.txt"] {
+		t.Fatal("reopened view must keep the pre-run input hash")
+	}
+	// VerifyView reports the drift against the recorded pre-run version.
+	drift, err := e2.VerifyView("drift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(drift) == 0 || !strings.Contains(drift[0], "src.txt") {
+		t.Fatalf("expected drift against recorded input, got %v", drift)
+	}
+}
+
+func TestCancelledActionIsMarkedNotStarted(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "hello")
+	e := diamond(t, root)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rep := e.BuildReport(ctx, "merge")
+	if !rep.Cancelled {
+		t.Fatal("expected cancellation")
+	}
+	for _, a := range rep.Actions {
+		if a.Status != engine.StatusCancelled {
+			t.Fatalf("action %q status %q", a.ID, a.Status)
+		}
+		if a.Started || a.Fingerprint != "" {
+			t.Fatalf("cancelled action %q must be marked not started: %+v", a.ID, a)
+		}
+		if a.Tool == "" {
+			t.Fatalf("cancelled action %q lost tool identity", a.ID)
+		}
+	}
+	merge := rep.Get("merge")
+	if len(merge.DependsOn) != 2 {
+		t.Fatalf("cancelled action lost dependency provenance: %+v", merge)
+	}
+}

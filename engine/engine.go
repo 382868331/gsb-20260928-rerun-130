@@ -368,11 +368,14 @@ func (e *Engine) Build(targets ...string) error {
 }
 
 // run executes one action with staged outputs and atomic publish. It
-// returns the input content hashes the build actually consumed. If any
-// input changes while the tool runs, the staged products are discarded,
-// no state is recorded, and an error is returned: such a product cannot
-// be attributed to a consistent source state and the action must be
-// rebuilt.
+// returns the input content hashes captured when execution started. If
+// any input changes while the tool runs, the staged products are
+// discarded, no state is recorded, and an error is returned: such a
+// product cannot be attributed to a consistent source state and the
+// action must be rebuilt. Even on failure after preflight, the pre-run
+// input hashes are returned so callers can record exactly which input
+// versions the failed attempt read; a nil map means the action never
+// started (its inputs could not even be read).
 func (e *Engine) run(a *Action) (map[string]string, error) {
 	tool := e.tools[a.Tool]
 	// Preflight inputs: an action may only consume published files that
@@ -419,7 +422,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 		staged[i] = filepath.Join(staging, out)
 	}
 	if err := tool.Run(a.Params, inputs, staged); err != nil {
-		return nil, fmt.Errorf("action %q failed: %w", a.ID, err)
+		return preHashes, fmt.Errorf("action %q failed: %w", a.ID, err)
 	}
 
 	// Verify all staged products before touching the workspace.
@@ -427,7 +430,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 	for i, out := range a.Outputs {
 		h, err := hashFile(staged[i])
 		if err != nil {
-			return nil, fmt.Errorf("action %q did not produce output %q: %w", a.ID, out, err)
+			return preHashes, fmt.Errorf("action %q did not produce output %q: %w", a.ID, out, err)
 		}
 		hashes[out] = h
 	}
@@ -439,10 +442,10 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 	for _, in := range a.Inputs {
 		h, err := hashFile(filepath.Join(e.root, in))
 		if err != nil {
-			return nil, fmt.Errorf("action %q: input %q changed during build and is now unreadable: %w", a.ID, in, err)
+			return preHashes, fmt.Errorf("action %q: input %q changed during build and is now unreadable: %w", a.ID, in, err)
 		}
 		if h != preHashes[in] {
-			return nil, fmt.Errorf("action %q: input %q changed during build; products discarded, rebuild required", a.ID, in)
+			return preHashes, fmt.Errorf("action %q: input %q changed during build; products discarded, rebuild required", a.ID, in)
 		}
 	}
 	fp := fingerprintFrom(a, preHashes)
@@ -463,7 +466,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 				continue
 			}
 			if mkErr := os.Mkdir(abs, 0o755); mkErr != nil {
-				return nil, fmt.Errorf("publish %q: %w", out, mkErr)
+				return preHashes, fmt.Errorf("publish %q: %w", out, mkErr)
 			}
 			madeDirs[sub] = true
 		}
@@ -510,11 +513,11 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 			m.hadOld = true
 			m.backup = filepath.Join(staging, ".old", fmt.Sprint(i))
 			if err := os.MkdirAll(filepath.Dir(m.backup), 0o755); err != nil {
-				return nil, fmt.Errorf("publish %q: %w", out, err)
+				return preHashes, fmt.Errorf("publish %q: %w", out, err)
 			}
 			if err := os.Rename(dest, m.backup); err != nil {
 				rollback()
-				return nil, fmt.Errorf("publish %q: %w", out, err)
+				return preHashes, fmt.Errorf("publish %q: %w", out, err)
 			}
 		}
 		if err := os.Rename(staged[i], dest); err != nil {
@@ -522,7 +525,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 				_ = os.Rename(m.backup, dest)
 			}
 			rollback()
-			return nil, fmt.Errorf("publish %q: %w", out, err)
+			return preHashes, fmt.Errorf("publish %q: %w", out, err)
 		}
 		moves = append(moves, m)
 		published++
@@ -548,7 +551,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 		} else {
 			delete(e.state.Actions, a.ID)
 		}
-		return nil, err
+		return preHashes, err
 	}
 	return preHashes, nil
 }
