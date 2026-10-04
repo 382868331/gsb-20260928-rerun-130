@@ -48,6 +48,9 @@ func (f ToolFunc) Run(params map[string]string, inputs, outputs []string) error 
 
 type actionState struct {
 	Fingerprint string
+	Tool        string            // tool that produced the outputs
+	Params      map[string]string // parameters the build actually used
+	Inputs      map[string]string // input path -> content hash at build time
 	Outputs     map[string]string // output path -> content hash
 }
 
@@ -274,6 +277,20 @@ func hashFile(path string) (string, error) {
 
 // fingerprint computes the content+parameter key for an action.
 func (e *Engine) fingerprint(a *Action) (string, error) {
+	hashes := map[string]string{}
+	for _, in := range a.Inputs {
+		h, err := hashFile(filepath.Join(e.root, in))
+		if err != nil {
+			return "", fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
+		}
+		hashes[in] = h
+	}
+	return fingerprintFrom(a, hashes), nil
+}
+
+// fingerprintFrom computes the content+parameter key for an action from
+// already-known input content hashes.
+func fingerprintFrom(a *Action, inputHashes map[string]string) string {
 	parts := [][]byte{[]byte(a.Tool)}
 	keys := make([]string, 0, len(a.Params))
 	for k := range a.Params {
@@ -286,13 +303,10 @@ func (e *Engine) fingerprint(a *Action) (string, error) {
 	inputs := append([]string(nil), a.Inputs...)
 	sort.Strings(inputs)
 	for _, in := range inputs {
-		h, err := hashFile(filepath.Join(e.root, in))
-		if err != nil {
-			return "", fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
-		}
+		h := inputHashes[in]
 		parts = append(parts, []byte(in), []byte(h))
 	}
-	return hashBytes(parts...), nil
+	return hashBytes(parts...)
 }
 
 // upToDate reports whether the action's recorded fingerprint still matches
@@ -345,7 +359,7 @@ func (e *Engine) Build(targets ...string) error {
 		if ok {
 			continue
 		}
-		if err := e.run(a); err != nil {
+		if _, err := e.run(a); err != nil {
 			return err
 		}
 		e.Ran = append(e.Ran, id)
@@ -353,28 +367,39 @@ func (e *Engine) Build(targets ...string) error {
 	return nil
 }
 
-// run executes one action with staged outputs and atomic publish.
-func (e *Engine) run(a *Action) error {
+// run executes one action with staged outputs and atomic publish. It
+// returns the input content hashes the build actually consumed. If any
+// input changes while the tool runs, the staged products are discarded,
+// no state is recorded, and an error is returned: such a product cannot
+// be attributed to a consistent source state and the action must be
+// rebuilt.
+func (e *Engine) run(a *Action) (map[string]string, error) {
 	tool := e.tools[a.Tool]
 	// Preflight inputs: an action may only consume published files that
 	// actually exist, never a half-published result. Fingerprinting below
 	// reads the same files for the cache key.
+	preHashes := map[string]string{}
 	for _, in := range a.Inputs {
 		info, err := os.Stat(filepath.Join(e.root, in))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("action %q: missing input %q", a.ID, in)
+				return nil, fmt.Errorf("action %q: missing input %q", a.ID, in)
 			}
-			return fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
+			return nil, fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
 		}
 		if info.IsDir() {
-			return fmt.Errorf("action %q: input %q is a directory", a.ID, in)
+			return nil, fmt.Errorf("action %q: input %q is a directory", a.ID, in)
 		}
+		h, err := hashFile(filepath.Join(e.root, in))
+		if err != nil {
+			return nil, fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
+		}
+		preHashes[in] = h
 	}
 
 	staging, err := os.MkdirTemp(e.root, ".staging-"+a.ID+"-")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.RemoveAll(staging)
 
@@ -389,12 +414,12 @@ func (e *Engine) run(a *Action) error {
 		// distinct instead of collapsing onto one staged file.
 		d := filepath.Join(staging, filepath.Dir(out))
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			return err
+			return nil, err
 		}
 		staged[i] = filepath.Join(staging, out)
 	}
 	if err := tool.Run(a.Params, inputs, staged); err != nil {
-		return fmt.Errorf("action %q failed: %w", a.ID, err)
+		return nil, fmt.Errorf("action %q failed: %w", a.ID, err)
 	}
 
 	// Verify all staged products before touching the workspace.
@@ -402,15 +427,25 @@ func (e *Engine) run(a *Action) error {
 	for i, out := range a.Outputs {
 		h, err := hashFile(staged[i])
 		if err != nil {
-			return fmt.Errorf("action %q did not produce output %q: %w", a.ID, out, err)
+			return nil, fmt.Errorf("action %q did not produce output %q: %w", a.ID, out, err)
 		}
 		hashes[out] = h
 	}
 
-	fp, err := e.fingerprint(a)
-	if err != nil {
-		return err
+	// Re-hash every input after the tool ran. A dependency that changed
+	// mid-build means the staged products were derived from a source state
+	// that no longer exists; discard them instead of publishing a product
+	// that belongs to no consistent view.
+	for _, in := range a.Inputs {
+		h, err := hashFile(filepath.Join(e.root, in))
+		if err != nil {
+			return nil, fmt.Errorf("action %q: input %q changed during build and is now unreadable: %w", a.ID, in, err)
+		}
+		if h != preHashes[in] {
+			return nil, fmt.Errorf("action %q: input %q changed during build; products discarded, rebuild required", a.ID, in)
+		}
 	}
+	fp := fingerprintFrom(a, preHashes)
 
 	// Prepare destination directories before publishing anything.
 	madeDirs := map[string]bool{}
@@ -428,7 +463,7 @@ func (e *Engine) run(a *Action) error {
 				continue
 			}
 			if mkErr := os.Mkdir(abs, 0o755); mkErr != nil {
-				return fmt.Errorf("publish %q: %w", out, mkErr)
+				return nil, fmt.Errorf("publish %q: %w", out, mkErr)
 			}
 			madeDirs[sub] = true
 		}
@@ -475,11 +510,11 @@ func (e *Engine) run(a *Action) error {
 			m.hadOld = true
 			m.backup = filepath.Join(staging, ".old", fmt.Sprint(i))
 			if err := os.MkdirAll(filepath.Dir(m.backup), 0o755); err != nil {
-				return fmt.Errorf("publish %q: %w", out, err)
+				return nil, fmt.Errorf("publish %q: %w", out, err)
 			}
 			if err := os.Rename(dest, m.backup); err != nil {
 				rollback()
-				return fmt.Errorf("publish %q: %w", out, err)
+				return nil, fmt.Errorf("publish %q: %w", out, err)
 			}
 		}
 		if err := os.Rename(staged[i], dest); err != nil {
@@ -487,14 +522,24 @@ func (e *Engine) run(a *Action) error {
 				_ = os.Rename(m.backup, dest)
 			}
 			rollback()
-			return fmt.Errorf("publish %q: %w", out, err)
+			return nil, fmt.Errorf("publish %q: %w", out, err)
 		}
 		moves = append(moves, m)
 		published++
 	}
 
 	// All products are published: commit state, then discard old versions.
-	newState := &actionState{Fingerprint: fp, Outputs: hashes}
+	params := map[string]string{}
+	for k, v := range a.Params {
+		params[k] = v
+	}
+	newState := &actionState{
+		Fingerprint: fp,
+		Tool:        a.Tool,
+		Params:      params,
+		Inputs:      preHashes,
+		Outputs:     hashes,
+	}
 	e.state.Actions[a.ID] = newState
 	if err := e.saveState(); err != nil {
 		rollback()
@@ -503,9 +548,9 @@ func (e *Engine) run(a *Action) error {
 		} else {
 			delete(e.state.Actions, a.ID)
 		}
-		return err
+		return nil, err
 	}
-	return nil
+	return preHashes, nil
 }
 
 func (e *Engine) saveState() error {
