@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,6 +50,9 @@ func (f ToolFunc) Run(params map[string]string, inputs, outputs []string) error 
 type actionState struct {
 	Fingerprint string
 	Outputs     map[string]string // output path -> content hash
+	Tool        string            // tool that produced the recorded outputs
+	Params      map[string]string // sorted-at-use parameters
+	Inputs      map[string]string // input path -> content hash at build time
 }
 
 type diskState struct {
@@ -272,8 +276,10 @@ func hashFile(path string) (string, error) {
 	return hashBytes(data), nil
 }
 
-// fingerprint computes the content+parameter key for an action.
-func (e *Engine) fingerprint(a *Action) (string, error) {
+// fingerprintDetails computes the content+parameter key for an action and
+// also returns the per-input content hashes it was derived from, so the
+// result can serve as provenance for anything built under this key.
+func (e *Engine) fingerprintDetails(a *Action) (string, map[string]string, error) {
 	parts := [][]byte{[]byte(a.Tool)}
 	keys := make([]string, 0, len(a.Params))
 	for k := range a.Params {
@@ -285,14 +291,22 @@ func (e *Engine) fingerprint(a *Action) (string, error) {
 	}
 	inputs := append([]string(nil), a.Inputs...)
 	sort.Strings(inputs)
+	inputHashes := map[string]string{}
 	for _, in := range inputs {
 		h, err := hashFile(filepath.Join(e.root, in))
 		if err != nil {
-			return "", fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
+			return "", nil, fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
 		}
 		parts = append(parts, []byte(in), []byte(h))
+		inputHashes[in] = h
 	}
-	return hashBytes(parts...), nil
+	return hashBytes(parts...), inputHashes, nil
+}
+
+// fingerprint computes the content+parameter key for an action.
+func (e *Engine) fingerprint(a *Action) (string, error) {
+	fp, _, err := e.fingerprintDetails(a)
+	return fp, err
 }
 
 // upToDate reports whether the action's recorded fingerprint still matches
@@ -407,7 +421,7 @@ func (e *Engine) run(a *Action) error {
 		hashes[out] = h
 	}
 
-	fp, err := e.fingerprint(a)
+	fp, inputHashes, err := e.fingerprintDetails(a)
 	if err != nil {
 		return err
 	}
@@ -494,7 +508,13 @@ func (e *Engine) run(a *Action) error {
 	}
 
 	// All products are published: commit state, then discard old versions.
-	newState := &actionState{Fingerprint: fp, Outputs: hashes}
+	newState := &actionState{
+		Fingerprint: fp,
+		Outputs:     hashes,
+		Tool:        a.Tool,
+		Params:      maps.Clone(a.Params),
+		Inputs:      inputHashes,
+	}
 	e.state.Actions[a.ID] = newState
 	if err := e.saveState(); err != nil {
 		rollback()
