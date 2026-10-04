@@ -359,7 +359,7 @@ func (e *Engine) Build(targets ...string) error {
 		if ok {
 			continue
 		}
-		if _, err := e.run(a); err != nil {
+		if _, _, err := e.run(a); err != nil {
 			return err
 		}
 		e.Ran = append(e.Ran, id)
@@ -367,13 +367,29 @@ func (e *Engine) Build(targets ...string) error {
 	return nil
 }
 
-// run executes one action with staged outputs and atomic publish. It
-// returns the input content hashes the build actually consumed. If any
-// input changes while the tool runs, the staged products are discarded,
-// no state is recorded, and an error is returned: such a product cannot
-// be attributed to a consistent source state and the action must be
-// rebuilt.
-func (e *Engine) run(a *Action) (map[string]string, error) {
+// runRecord is the provenance captured for a single execution attempt:
+// the exact input content hashes read when the attempt began, the
+// fingerprint derived from them, and whether the tool actually started.
+// It is returned even on failure or input drift so callers can attribute
+// the unsuccessful attempt to a concrete input version without reading
+// the (possibly already changed) files again.
+type runRecord struct {
+	Started     bool
+	Fingerprint string
+	Inputs      map[string]string // input path -> content hash at start
+}
+
+// run executes one action with staged outputs and atomic publish. On
+// success it returns the input content hashes the build actually consumed.
+// On every outcome the returned record holds whatever input hashes were
+// read before the tool started and the fingerprint they produced; if the
+// inputs could not all be read, the record simply holds fewer hashes. If
+// any input changes while the tool runs, the staged products are
+// discarded, no state is recorded, and an error is returned: such a
+// product cannot be attributed to a consistent source state and the
+// action must be rebuilt.
+func (e *Engine) run(a *Action) (*runRecord, map[string]string, error) {
+	rec := &runRecord{Inputs: map[string]string{}}
 	tool := e.tools[a.Tool]
 	// Preflight inputs: an action may only consume published files that
 	// actually exist, never a half-published result. Fingerprinting below
@@ -383,23 +399,28 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 		info, err := os.Stat(filepath.Join(e.root, in))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return nil, fmt.Errorf("action %q: missing input %q", a.ID, in)
+				return rec, nil, fmt.Errorf("action %q: missing input %q", a.ID, in)
 			}
-			return nil, fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
+			return rec, nil, fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
 		}
 		if info.IsDir() {
-			return nil, fmt.Errorf("action %q: input %q is a directory", a.ID, in)
+			return rec, nil, fmt.Errorf("action %q: input %q is a directory", a.ID, in)
 		}
 		h, err := hashFile(filepath.Join(e.root, in))
 		if err != nil {
-			return nil, fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
+			return rec, nil, fmt.Errorf("action %q: input %q: %w", a.ID, in, err)
 		}
 		preHashes[in] = h
 	}
+	// The attempt now has a concrete, complete input version. Freeze it
+	// before the tool can observe or modify anything, together with the
+	// fingerprint, so even a failure is attributable.
+	rec.Fingerprint = fingerprintFrom(a, preHashes)
+	rec.Inputs = preHashes
 
 	staging, err := os.MkdirTemp(e.root, ".staging-"+a.ID+"-")
 	if err != nil {
-		return nil, err
+		return rec, nil, err
 	}
 	defer os.RemoveAll(staging)
 
@@ -414,12 +435,16 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 		// distinct instead of collapsing onto one staged file.
 		d := filepath.Join(staging, filepath.Dir(out))
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, err
+			return rec, nil, err
 		}
 		staged[i] = filepath.Join(staging, out)
 	}
+	// The tool is about to execute: this attempt has started. Staging
+	// setup failures above mean the tool never ran, so they keep
+	// Started == false and are reported as failed-before-start.
+	rec.Started = true
 	if err := tool.Run(a.Params, inputs, staged); err != nil {
-		return nil, fmt.Errorf("action %q failed: %w", a.ID, err)
+		return rec, nil, fmt.Errorf("action %q failed: %w", a.ID, err)
 	}
 
 	// Verify all staged products before touching the workspace.
@@ -427,7 +452,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 	for i, out := range a.Outputs {
 		h, err := hashFile(staged[i])
 		if err != nil {
-			return nil, fmt.Errorf("action %q did not produce output %q: %w", a.ID, out, err)
+			return rec, nil, fmt.Errorf("action %q did not produce output %q: %w", a.ID, out, err)
 		}
 		hashes[out] = h
 	}
@@ -439,13 +464,12 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 	for _, in := range a.Inputs {
 		h, err := hashFile(filepath.Join(e.root, in))
 		if err != nil {
-			return nil, fmt.Errorf("action %q: input %q changed during build and is now unreadable: %w", a.ID, in, err)
+			return rec, nil, fmt.Errorf("action %q: input %q changed during build and is now unreadable: %w", a.ID, in, err)
 		}
 		if h != preHashes[in] {
-			return nil, fmt.Errorf("action %q: input %q changed during build; products discarded, rebuild required", a.ID, in)
+			return rec, nil, fmt.Errorf("action %q: input %q changed during build; products discarded, rebuild required", a.ID, in)
 		}
 	}
-	fp := fingerprintFrom(a, preHashes)
 
 	// Prepare destination directories before publishing anything.
 	madeDirs := map[string]bool{}
@@ -463,7 +487,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 				continue
 			}
 			if mkErr := os.Mkdir(abs, 0o755); mkErr != nil {
-				return nil, fmt.Errorf("publish %q: %w", out, mkErr)
+				return rec, nil, fmt.Errorf("publish %q: %w", out, mkErr)
 			}
 			madeDirs[sub] = true
 		}
@@ -510,11 +534,11 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 			m.hadOld = true
 			m.backup = filepath.Join(staging, ".old", fmt.Sprint(i))
 			if err := os.MkdirAll(filepath.Dir(m.backup), 0o755); err != nil {
-				return nil, fmt.Errorf("publish %q: %w", out, err)
+				return rec, nil, fmt.Errorf("publish %q: %w", out, err)
 			}
 			if err := os.Rename(dest, m.backup); err != nil {
 				rollback()
-				return nil, fmt.Errorf("publish %q: %w", out, err)
+				return rec, nil, fmt.Errorf("publish %q: %w", out, err)
 			}
 		}
 		if err := os.Rename(staged[i], dest); err != nil {
@@ -522,7 +546,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 				_ = os.Rename(m.backup, dest)
 			}
 			rollback()
-			return nil, fmt.Errorf("publish %q: %w", out, err)
+			return rec, nil, fmt.Errorf("publish %q: %w", out, err)
 		}
 		moves = append(moves, m)
 		published++
@@ -534,7 +558,7 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 		params[k] = v
 	}
 	newState := &actionState{
-		Fingerprint: fp,
+		Fingerprint: rec.Fingerprint,
 		Tool:        a.Tool,
 		Params:      params,
 		Inputs:      preHashes,
@@ -548,9 +572,9 @@ func (e *Engine) run(a *Action) (map[string]string, error) {
 		} else {
 			delete(e.state.Actions, a.ID)
 		}
-		return nil, err
+		return rec, nil, err
 	}
-	return preHashes, nil
+	return rec, preHashes, nil
 }
 
 func (e *Engine) saveState() error {

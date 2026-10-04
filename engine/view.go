@@ -27,6 +27,35 @@ type View struct {
 	Actions   []*ActionReport `json:"actions"`
 }
 
+// Get returns the saved report entry for action id, or nil. It consults
+// only the saved view, so it works identically right after SaveView and
+// in a process that reopened the workspace much later.
+func (v *View) Get(id string) *ActionReport {
+	for _, a := range v.Actions {
+		if a.ID == id {
+			return a
+		}
+	}
+	return nil
+}
+
+// ExplainAction explains the saved attempt of one action entirely from
+// the view's own recorded data. It never reads the current workspace, so
+// the explanation cannot be retroactively rewritten from present file
+// contents: a failed or drifted attempt is attributed to the exact input
+// fingerprints captured when that attempt started.
+func (e *Engine) ExplainView(name, id string) ([]string, error) {
+	v, err := e.View(name)
+	if err != nil {
+		return nil, err
+	}
+	a := v.Get(id)
+	if a == nil {
+		return nil, fmt.Errorf("view %q has no record of action %q", name, id)
+	}
+	return a.Explain(), nil
+}
+
 func (e *Engine) viewsDir() string { return filepath.Join(e.root, ".views") }
 
 func validViewName(name string) error {

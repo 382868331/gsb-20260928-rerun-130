@@ -11,8 +11,9 @@
 - **重启恢复**：每个动作完成后状态即时落盘（.buildstate.json，原子写），新进程打开同一目录即可继续增量构建。
 - **构建途中变化检测**：动作执行前后分别哈希全部输入，若依赖在构建途中被改动，暂存产物直接丢弃、不发布、不记账——该产物不属于任何一致的源码视图，必须重建。
 - **可保存的构建视图**：SaveView 把一次 BuildReport 的结果（每个动作实际使用的输入/参数/产物内容哈希，含失败部分）保存到 .views/<name>.json。视图不可变：同名保存被拒绝，View(name) 永远返回当初保存的记录，后来的源码变化不会悄悄替换它；VerifyView 只报告当前工作区与视图的漂移，不修改视图。
+- **未成功动作的完整依据**：动作状态明确区分“未开始”（cancelled/skipped，started=false，未选定任何输入版本，因此不记录指纹）与“已开始但未成功”（failed/drifted，started=true）。已开始的失败与输入漂移（输入在执行期间被改动，状态 drifted）都冻结并保留动作开始执行那一刻读取的输入哈希、由其推导出的指纹、工具身份（tool）以及依赖来源（depends_on）；这些依据随视图落盘，重新打开引擎后 View/ExplainView/ActionReport.Explain 仍只依据保存的记录解释那次构建，绝不会用当前文件内容回填历史。
 - **实验候选**：ForkCandidate 从当前已知状态复制出独立候选（.candidates/<name>/），各自持有独立状态文件，候选之间不会串用缓存（内容哈希一致才可复用，即可用）。AdoptCandidate 把候选记录的源码修改与产物应用回主工作区；候选目录及其视图（含失败依据）原样保留。CompareViews 按动作对比两个视图，指出真正不同的输入与产物。
-- **构建报告与解释**：BuildReport(ctx, ...) 收集每个动作的状态（ran/reused/failed/skipped/cancelled）与来源哈希，单个目标失败不阻塞无关目标；ctx 取消后不再调度新动作，已完成动作的状态已落盘，重开后续跑。Explain(id) 基于落盘状态逐条说明产物可复用的原因，或哪个输入/参数/产物变化真正导致了重建。
+- **构建报告与解释**：BuildReport(ctx, ...) 收集每个动作的状态（ran/reused/failed/drifted/skipped/cancelled）、是否已开始（started）与来源哈希，单个目标失败不阻塞无关目标；ctx 取消后不再调度新动作，已完成动作的状态已落盘，重开后续跑。Explain(id) 基于落盘状态逐条说明产物可复用的原因，或哪个输入/参数/产物变化真正导致了重建；视图中的 ActionReport.Explain() 与 ExplainView(view, id) 只凭保存时的记录解释历史构建。
 
 ## 用法
 
