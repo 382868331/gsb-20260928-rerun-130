@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -451,4 +452,207 @@ func TestCancelledActionIsMarkedNotStarted(t *testing.T) {
 	if len(merge.DependsOn) != 2 {
 		t.Fatalf("cancelled action lost dependency provenance: %+v", merge)
 	}
+}
+
+func TestImpactComparisonAttributesSharedDependencyFailureAndReopen(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "hello")
+	write(t, root, "bad.txt", "boom")
+	e := diamond(t, root)
+	e.RegisterTool("fail", engine.ToolFunc(func(map[string]string, []string, []string) error {
+		return errors.New("always fails")
+	}))
+	if err := e.AddAction(engine.Action{ID: "bad", Tool: "fail",
+		Inputs: []string{"gen/a.txt", "bad.txt"}, Outputs: []string{"out/bad.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	v1Rep := e.BuildReport(context.Background(), "merge", "bad")
+	if v1Rep.Err == nil {
+		t.Fatal("expected bad to fail")
+	}
+	v1, err := e.SaveView("v1", v1Rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	write(t, root, "src.txt", "world")
+	v2Rep := e.BuildReport(context.Background(), "merge", "bad")
+	if v2Rep.Err == nil {
+		t.Fatal("expected bad to remain failed")
+	}
+	v2, err := e.SaveView("v2", v2Rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = v2
+
+	// Later files must not be used to explain either old build.
+	write(t, root, "src.txt", "changed after both views")
+	reopened, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1Loaded, err := reopened.View("v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Loaded, err := reopened.View("v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	impact := engine.CompareViewImpacts(v1Loaded, v2Loaded)
+	if impact == nil || impact.A != "v1" || impact.B != "v2" {
+		t.Fatalf("unexpected comparison: %+v", impact)
+	}
+
+	merge := impact.Target("merge")
+	if merge == nil || merge.StatusA != engine.StatusRan || merge.StatusB != engine.StatusRan {
+		t.Fatalf("unexpected successful target: %+v", merge)
+	}
+	if len(merge.ReusableActions) != 0 {
+		t.Fatalf("source change invalidates the diamond: %v", merge.ReusableActions)
+	}
+	if fact, ok := findDirectInput(merge, "src.txt"); !ok || fact.HashA == fact.HashB {
+		t.Fatalf("missing changed direct input: %+v", merge.DirectInputs)
+	}
+	if dep, ok := findSharedDependency(merge, "gen", "gen/a.txt"); !ok || dep.Change.HashA == dep.Change.HashB {
+		t.Fatalf("missing changed shared dependency gen/a.txt: %+v", merge.SharedDependencies)
+	}
+	if _, ok := findSharedDependency(merge, "left", "mid/b.txt"); !ok {
+		t.Fatalf("missing downstream shared dependency: %+v", merge.SharedDependencies)
+	}
+
+	bad := impact.Target("bad")
+	if bad == nil || bad.StatusA != engine.StatusFailed || bad.StatusB != engine.StatusFailed {
+		t.Fatalf("unexpected failing target: %+v", bad)
+	}
+	var failedEvidence []engine.InconclusiveAction
+	for _, action := range bad.Actions {
+		if action.ID == "bad" {
+			failedEvidence = action.Inconclusive
+		}
+	}
+	if len(failedEvidence) != 2 ||
+		failedEvidence[0].Side != "a" || failedEvidence[0].Status != engine.StatusFailed || !failedEvidence[0].Started ||
+		failedEvidence[1].Side != "b" || failedEvidence[1].Status != engine.StatusFailed || !failedEvidence[1].Started {
+		t.Fatalf("failed attempts lost start/stop evidence: %+v", failedEvidence)
+	}
+	if _, ok := findSharedDependency(bad, "gen", "gen/a.txt"); !ok {
+		t.Fatalf("failed target must still attribute changed shared dependency: %+v", bad.SharedDependencies)
+	}
+	if got := v1Loaded.Actions[0].Inputs["src.txt"]; got != v1.Actions[0].Inputs["src.txt"] {
+		t.Fatal("old view changed after reopen")
+	}
+}
+
+func TestImpactComparisonDetectsToolIdentityChange(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "hello")
+	e1 := diamond(t, root)
+	v1, err := e1.SaveView("copy-tool", reportOf(t, e1, "gen"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e2, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2.RegisterTool("same-copy", engine.ToolFunc(tools.Copy))
+	if err := e2.AddAction(engine.Action{ID: "gen", Tool: "same-copy",
+		Inputs: []string{"src.txt"}, Outputs: []string{"gen/a.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	v2, err := e2.SaveView("identity-tool", reportOf(t, e2, "gen"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	impact := engine.CompareViewImpacts(v1, v2)
+	gen := impact.Target("gen")
+	if gen == nil || len(gen.ToolChanges) != 1 {
+		t.Fatalf("expected one identity change, got %+v", gen)
+	}
+	change := gen.ToolChanges[0]
+	if !change.ToolChanged || change.ToolA != "copy" || change.ToolB != "same-copy" {
+		t.Fatalf("wrong tool identity change: %+v", change)
+	}
+	if len(gen.DirectInputs) != 0 || len(gen.SharedDependencies) != 0 {
+		t.Fatalf("tool change should not be mislabeled as input change: %+v", gen)
+	}
+	if len(gen.ReusableActions) != 0 {
+		t.Fatalf("different tool identity cannot be reusable: %+v", gen)
+	}
+}
+
+func TestPlanFromImpactsPreviewsSharedWorkAndRefreshesImpact(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "src.txt", "hello")
+	e := diamond(t, root)
+	v1, err := e.SaveView("v1", reportOf(t, e, "left", "right"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "src.txt", "world")
+	v2, err := e.SaveView("v2", reportOf(t, e, "left", "right"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	impact := engine.CompareViewImpacts(v1, v2)
+
+	// Current state is v2, so the full two-target preview first shows gen as
+	// a shared dependency and every action reusable.
+	plan, err := e.NewBuildPlan(impact, "left", "right")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(plan.SharedDependencies, []string{"gen"}) {
+		t.Fatalf("shared dependency = %v", plan.SharedDependencies)
+	}
+	if len(plan.ActionsToRun) != 0 || len(plan.ReusableActions) != 3 {
+		t.Fatalf("unexpected initial plan: run=%v reusable=%v", plan.ActionsToRun, plan.ReusableActions)
+	}
+
+	write(t, root, "src.txt", "changed while confirming")
+	refresh, err := e.RefreshPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.ActionsToRun) != 0 {
+		t.Fatalf("old plan was mutated during refresh: %v", plan.ActionsToRun)
+	}
+	if len(refresh.ChangedInputs) != 1 || refresh.ChangedInputs[0] != "src.txt" {
+		t.Fatalf("changed inputs = %v", refresh.ChangedInputs)
+	}
+	if !reflect.DeepEqual(refresh.NewlyRequired, []string{"gen", "left", "right"}) {
+		t.Fatalf("newly required = %v", refresh.NewlyRequired)
+	}
+	updated := refresh.UpdatedPlan
+	if !reflect.DeepEqual(updated.SharedDependencies, []string{"gen"}) ||
+		!reflect.DeepEqual(updated.PossibleDuplicateWork, []string{"gen"}) {
+		t.Fatalf("updated shared/duplicate work: shared=%v duplicate=%v",
+			updated.SharedDependencies, updated.PossibleDuplicateWork)
+	}
+	if !reflect.DeepEqual(updated.ActionsToRun, []string{"gen", "left", "right"}) {
+		t.Fatalf("updated actions to run = %v", updated.ActionsToRun)
+	}
+}
+
+func findDirectInput(target *engine.TargetImpact, path string) (engine.FactChange, bool) {
+	for _, fact := range target.DirectInputs {
+		if fact.Path == path {
+			return fact, true
+		}
+	}
+	return engine.FactChange{}, false
+}
+
+func findSharedDependency(target *engine.TargetImpact, action, input string) (engine.DependencyChange, bool) {
+	for _, dep := range target.SharedDependencies {
+		if dep.Action == action && dep.Input == input {
+			return dep, true
+		}
+	}
+	return engine.DependencyChange{}, false
 }
